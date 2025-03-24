@@ -8,6 +8,7 @@
 ## Ideia do Controle
 Este projeto consiste em um **volante personalizado** para uso em *Need for Speed*, porém **sem pedais analógicos**. Em vez disso, **aceleração** e **freio** serão acionados por **botões digitais**. Haverá:
 - **1 eixo analógico** (potenciômetro) para o ângulo de direção do volante.
+- **1 joystick analógico** para movimentação no menu do jogo.
 - **5 entradas digitais** (GPIO) para as principais funções de corrida (acelerar, frear, trocar marcha para cima/baixo, nitro).
 
 Além disso, teremos **feedback** por meio de um **LED indicador** e um **buzzer** para alertas ou efeitos sonoros simples.
