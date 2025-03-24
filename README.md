@@ -50,7 +50,7 @@ Além disso, teremos **feedback** por meio de um **LED indicador** e um **buzzer
 ### Estrutura Geral
 ---
 
-![Estrutura](estrutura.png)
+![Estrutura](diagrama-white.png)
 
 ---
 
@@ -77,6 +77,6 @@ Além disso, teremos **feedback** por meio de um **LED indicador** e um **buzzer
 ### Proposta Inicial
 ---
 
-![Proposta](esboco.png)
+![Proposta](esboco.jpg)
 
 ---
