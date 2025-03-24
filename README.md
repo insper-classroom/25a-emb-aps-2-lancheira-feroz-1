@@ -19,8 +19,13 @@ Além disso, teremos **feedback** por meio de um **LED indicador** e um **buzzer
 1. **Volante (Eixo Analógico)**  
    - **Potenciômetro** acoplado ao eixo do volante para detectar o ângulo de rotação.  
    - Valores podem variar de 0 a 1023 (caso de ADC de 10 bits), mapeados para esquerda (0) até direita (máximo).
+  
+2. **Joystick Analógico (Para Menu)**
+   - Um pequeno joystick com ao menos **2 eixos analógicos** (eixo X e eixo Y).  
+   - Serve para navegar pelos menus do jogo (selecionar opções, voltar, trocar configurações, etc.).  
+   - Cada eixo envia valores de 0 a 1023 (ADC de 10 bits), podendo ser mapeados para cima/baixo/esquerda/direita dentro do menu.
 
-2. **5 Entradas Digitais (Botões/GPIO):**  
+3. **5 Entradas Digitais (Botões/GPIO):**  
    1. **Acelerar (Botão)** – em vez de pedal analógico.  
    2. **Frear (Botão)** – em vez de pedal analógico.  
    3. **Shift Up** (troca de marcha para cima).  
