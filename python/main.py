@@ -23,7 +23,7 @@ button_key_map = {
     20: 's',      # Freia
     18: 'e',      # Sobe marcha
     19: 'q',      # Desce marcha
-    16: Key.space # Freio de mão
+    17: Key.space # Freio de mão
 }
 
 # Mapeamento dos modos (click ou hold) para cada botão
@@ -32,28 +32,41 @@ button_key_map = {
 button_mode = {
     21: "hold",   # Acelera: modo hold (você poderá mantê-lo pressionado)
     20: "hold",   # Freia: modo hold
-    18: "hold",  # Sobe marcha: clique (disparo único)
-    19: "hold",  # Desce marcha: clique
-    16: "hold"    # Freio de mão: modo hold
+    18: "hold",   # Sobe marcha: clique (disparo único)
+    19: "hold",   # Desce marcha: clique
+    17: "hold"    # Freio de mão: modo hold
 }
 
 # Dicionário para manter o estado dos botões digitais em modo "hold"
 current_hold = {}  # Ex: {21: True} se o botão 21 estiver pressionado
 
-# Para os sinais analógicos (joystick e potenciômetro), mantemos o estado atual e timestamps.
+# Para os sinais analógicos do joystick, mantemos o estado atual e timestamps.
 current_keys = {
     'joystick_x': None,  # Eixo horizontal: Key.left ou Key.right
-    'joystick_y': None,  # Eixo vertical: Key.up ou Key.down
-    'wheel': None        # Potenciômetro (volante): 'a' ou 'd'
+    'joystick_y': None   # Eixo vertical: Key.up ou Key.down
 }
 
 last_update = {
     'joystick_x': 0,
-    'joystick_y': 0,
-    'wheel': 0
+    'joystick_y': 0
 }
 
-# Timeout para considerar que o dispositivo (joystick ou volante) voltou à posição neutra
+# Variável para controlar o instante do último clique simulado do potenciômetro (não será usada na nova lógica de hold)
+last_wheel_click = 0
+
+# Constantes para o comportamento do potenciômetro (axis 2)
+MIN_THRESHOLD = 60   # Zona morta: valores abaixo de 30 (ou acima de -30) não acionam nada
+MIN_HOLD = 0.25       # Tempo mínimo de hold (segundos)
+MAX_HOLD = 0.5       # Tempo máximo de hold para giros intensos (segundos)
+CONTINUOUS_THRESHOLD = 0.95  # Se o valor normalizado (ratio) atingir esse valor, mantém pressionado continuamente
+
+# Variáveis globais para controlar o estado do potenciômetro (axis 2)
+wheel_holding = False     # Indica se a tecla do potenciômetro está atualmente pressionada
+wheel_current_key = None  # Armazena a tecla atualmente pressionada ('a' ou 'd')
+wheel_hold_start = 0.0    # Timestamp de quando a tecla foi pressionada
+wheel_hold_duration = 0.0 # Duração calculada para manter o hold
+
+# Timeout para liberar as teclas do joystick caso não haja atualização
 JOYSTICK_TIMEOUT = 0.1  # segundos
 
 def handle_analog(axis, value):
@@ -61,29 +74,75 @@ def handle_analog(axis, value):
     Processa sinais analógicos para gerar eventos de teclado.
     
     - Para o potenciômetro (axis 2):
-      Se value < -30, mapeia para tecla 'd';
-      se value > 30, mapeia para tecla 'a';
-      se value == 0 (ou dentro da zona morta), a tecla é liberada.
-      A tecla é mantida pressionada enquanto houver sinal (modo hold contínuo).
+      Se value > MIN_THRESHOLD, mapeia para tecla 'a';
+      se value < -MIN_THRESHOLD, mapeia para tecla 'd';
+      caso contrário, não aciona nada.
+      
+      Quando o sinal estiver presente, calcula a magnitude efetiva (valor absoluto - MIN_THRESHOLD)
+      e o valor normalizado (ratio). Se ratio >= CONTINUOUS_THRESHOLD, a tecla é mantida pressionada
+      continuamente; caso contrário, simula um "click hold" em que a tecla é pressionada e mantida por
+      um tempo T_hold proporcional à intensidade do giro, e após esse período é liberada (para reiniciar o ciclo).
     
-    - Para o joystick:
+    - Para o joystick (axis 0 e 1):
       * Eixo 0 (horizontal): valor negativo → Key.left, positivo → Key.right.
       * Eixo 1 (vertical): valor negativo → Key.up, positivo → Key.down.
       Usa timeout para liberar a tecla se não houver atualização.
     """
-    global current_keys, last_update
+    global wheel_holding, wheel_current_key, wheel_hold_start, wheel_hold_duration
     now = time.time()
-
+    
     if axis == 2:
-        # Potenciômetro: mapeia para 'd' se value negativo (fora da zona morta) ou 'a' se positivo.
-        desired = 'd' if value < -30 else ('a' if value > 30 else None)
-        last_update['wheel'] = now
-        if current_keys['wheel'] != desired:
-            if current_keys['wheel'] is not None:
-                keyboard.release(current_keys['wheel'])
-            current_keys['wheel'] = desired
-            if desired is not None:
+        # Determina a tecla desejada a partir do sinal do potenciômetro
+        if value > MIN_THRESHOLD:
+            desired = 'a'
+        elif value < -MIN_THRESHOLD:
+            desired = 'd'
+        else:
+            desired = None
+        
+        # Se o sinal não ultrapassar a zona morta, libera tecla se estiver pressionada
+        if desired is None:
+            if wheel_holding:
+                keyboard.release(wheel_current_key)
+                wheel_holding = False
+                wheel_current_key = None
+            return
+        
+        # Calcula a magnitude efetiva e o ratio normalizado (0 a 1)
+        magnitude = abs(value) - MIN_THRESHOLD  # varia de 0 até ~225 (se o valor máximo for 255)
+        ratio = magnitude / 225.0
+        if ratio > 1.0:
+            ratio = 1.0
+        
+        # Se o giro estiver próximo do máximo, mantém a tecla pressionada continuamente
+        if ratio >= CONTINUOUS_THRESHOLD:
+            if (not wheel_holding) or (wheel_current_key != desired):
+                if wheel_holding and wheel_current_key is not None and wheel_current_key != desired:
+                    keyboard.release(wheel_current_key)
                 keyboard.press(desired)
+                wheel_holding = True
+                wheel_current_key = desired
+            # Em hold contínuo, não realizamos liberação
+        else:
+            # Para giros não máximos, calcula o tempo de hold proporcional à intensidade do giro.
+            # Quanto maior o giro (maior ratio), maior o tempo que a tecla será mantida pressionada.
+            # Aqui usamos uma relação linear entre MIN_HOLD e MAX_HOLD.
+            T_hold = MIN_HOLD + (MAX_HOLD - MIN_HOLD) * ratio
+            if not wheel_holding:
+                # Se a tecla ainda não estiver pressionada, inicia o hold
+                keyboard.press(desired)
+                wheel_holding = True
+                wheel_current_key = desired
+                wheel_hold_start = now
+                wheel_hold_duration = T_hold
+            else:
+                # Se a tecla já está pressionada e o mesmo desired, verifica se o período de hold expirou.
+                if now - wheel_hold_start >= wheel_hold_duration:
+                    keyboard.release(desired)
+                    wheel_holding = False
+                    wheel_current_key = None
+                    # Se o sinal ainda estiver presente, na próxima iteração um novo ciclo de hold será iniciado.
+    
     elif axis == 0:
         # Joystick horizontal
         desired = Key.left if value < 0 else (Key.right if value > 0 else None)
@@ -94,6 +153,7 @@ def handle_analog(axis, value):
             current_keys['joystick_x'] = desired
             if desired is not None:
                 keyboard.press(desired)
+    
     elif axis == 1:
         # Joystick vertical
         desired = Key.up if value < 0 else (Key.down if value > 0 else None)
@@ -121,7 +181,6 @@ def handle_button(button, state):
         return
 
     if mode == "click":
-        # Apenas no rising edge, simula um click
         if state == 1:
             keyboard.press(key)
             keyboard.release(key)
@@ -179,8 +238,8 @@ def process_packet(packet):
 
 def check_timeouts():
     """
-    Verifica os timeouts para liberar as teclas dos dispositivos analógicos caso não haja atualização.
-    Para joystick e volante, se não houver atualização por JOYSTICK_TIMEOUT, libera a tecla.
+    Verifica os timeouts para liberar as teclas dos dispositivos analógicos (joystick) caso não haja atualização.
+    Para o volante (potenciômetro), o comportamento é baseado na lógica de hold e não necessita de timeout.
     """
     now = time.time()
     if current_keys['joystick_x'] is not None and now - last_update['joystick_x'] > JOYSTICK_TIMEOUT:
@@ -189,9 +248,6 @@ def check_timeouts():
     if current_keys['joystick_y'] is not None and now - last_update['joystick_y'] > JOYSTICK_TIMEOUT:
         keyboard.release(current_keys['joystick_y'])
         current_keys['joystick_y'] = None
-    if current_keys['wheel'] is not None and now - last_update['wheel'] > JOYSTICK_TIMEOUT:
-        keyboard.release(current_keys['wheel'])
-        current_keys['wheel'] = None
 
 def main():
     try:
@@ -204,12 +260,10 @@ def main():
     print("Iniciando leitura da UART...")
     try:
         while True:
-            # Lê os dados disponíveis da serial
             data = ser.read(ser.in_waiting or 1)
             if data:
                 buffer.extend(data)
 
-            # Processa pacotes enquanto houver bytes suficientes
             while len(buffer) >= 6:
                 if buffer[0] != PKT_HEADER:
                     buffer.pop(0)
@@ -227,22 +281,18 @@ def main():
                 process_packet(packet)
                 buffer = buffer[packet_length:]
             
-            # Verifica timeouts para liberar as teclas, se necessário
             check_timeouts()
-
             time.sleep(0.01)
     except KeyboardInterrupt:
         print("Encerrando leitura...")
     finally:
         ser.close()
-        # Libera todas as teclas atualmente pressionadas
         for key in current_keys.values():
             if key is not None:
                 keyboard.release(key)
-        # Libera teclas em hold, se houver
         for key in current_hold.values():
             if key:
-                # Se necessário, pode liberar as teclas que estão em hold
+                # Se necessário, liberar as teclas em hold
                 pass
 
 if __name__ == '__main__':
