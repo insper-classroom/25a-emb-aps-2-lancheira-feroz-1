@@ -272,7 +272,7 @@ void uart_task(void *p) {
                 else if (!btn.state && uxSemaphoreGetCount(xAccelerateSemaphore) > 0)
                     xSemaphoreTake(xAccelerateSemaphore, 0);
             }
-            uint8_t payload[BUTTON_PAYLOAD_SIZE] = { (uint8_t)btn.gpio, (uint8_t)btn.state };
+            const uint8_t payload[BUTTON_PAYLOAD_SIZE] = { (uint8_t)btn.gpio, (uint8_t)btn.state };
             send_packet_uart(MSG_BUTTON, payload, BUTTON_PAYLOAD_SIZE);
         }
         
@@ -280,7 +280,7 @@ void uart_task(void *p) {
         if (uxSemaphoreGetCount(xCommSemaphore) > 0) {
             // Processa dados do ADC
             while (xQueueReceive(xQueueADC, &adc_data, 0) == pdPASS) {
-                uint8_t payload[ANALOG_PAYLOAD_SIZE] = {
+                const uint8_t payload[ANALOG_PAYLOAD_SIZE] = {
                     (uint8_t)adc_data.axis,
                     (uint8_t)((adc_data.val >> 8) & 0xFF),
                     (uint8_t)(adc_data.val & 0xFF)
