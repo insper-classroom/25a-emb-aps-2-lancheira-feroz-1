@@ -1,367 +1,381 @@
-/*
- * Comunicação UART melhorada com FreeRTOS, utilizando semáforo para o START.
- * Agora os eventos dos botões são transmitidos com o estado:
- *   - 1: botão pressionado (FALL)
- *   - 0: botão liberado (RISE)
- * 
- * Protocolo:
- *   Header     : 0xAA
- *   Tipo       : 0x01 = sinal analógico, 0x02 = evento de botão
- *   Tamanho    : tamanho do payload (1 byte para identificação + 1 byte para estado ou 3 bytes para analógico)
- *   Payload    : 
- *                 - Para analógico: 1 byte (eixo: 0=X, 1=Y, 2=pot) + 2 bytes (valor int16_t em MSB/LSB)
- *                 - Para botão  : 1 byte (identificador do botão) + 1 byte (estado: 1 = pressionado, 0 = liberado)
- *   Checksum   : XOR de (Tipo, Tamanho e Payload)
- *   Footer     : 0xFF
- *
- * Obs.: Pode-se implementar "byte stuffing" se os dados puderem conter os valores do header/footer.
- */
+#include <FreeRTOS.h>
+#include <task.h>
+#include <queue.h>
+#include <semphr.h>
 
- #include <FreeRTOS.h>
- #include <task.h>
- #include <queue.h>
- #include <semphr.h>
- #include "pico/stdlib.h"
- #include "hardware/gpio.h"
- #include "hardware/adc.h"
- #include "hardware/uart.h"
- #include <stdio.h>
- #include <stdint.h>
- 
- // ---------------- Constantes e Definições ---------------- //
- 
- #define AVG_SAMPLES        10
- 
- #define ADC_MAX            4095
- #define ADC_CENTER         2048
- #define JOYSTICK_MAX       255
- #define DEAD_ZONE          30
- 
- // Pinos de hardware
- const int LED              = 15;
- const int START_BTN        = 16;
- const int CLUTCH_BTN       = 17;
- const int UPSHIFT_BTN      = 18;
- const int DOWNSHIFT_BTN    = 19;
- const int BREAK_BTN        = 20;
- const int ACCELERATE_BTN   = 21;
- const int WHEEL_PIN        = 28;
- 
- const int GPy              = 27;
- const int GPx              = 26;
- 
- // Configuração da UART
- const int UART_TX          = 0;
- const int UART_RX          = 1;
- #define BAUD_RATE          115200
- #define UART_ID            uart0
- 
- // Definições do protocolo
- #define PKT_HEADER         0xAA
- #define PKT_FOOTER         0xFF
- 
- #define MSG_ANALOG         0x01
- #define MSG_BUTTON         0x02
- 
- // Tamanhos dos payloads
- #define ANALOG_PAYLOAD_SIZE   3   // 1 byte para o eixo + 2 bytes para o valor
- #define BUTTON_PAYLOAD_SIZE   2   // 1 byte para o identificador + 1 byte para o estado
- 
- // ---------------- Estruturas e Variáveis Globais ---------------- //
- 
- // Semáforo para indicar que a comunicação foi iniciada via botão START
- SemaphoreHandle_t xCommSemaphore;
- 
- // Estrutura para dados analógicos
- typedef struct {
-     int axis;  // 0 = eixo X, 1 = eixo Y, 2 = potenciômetro
-     int val;   // Valor processado (-255 a +255)
- } adc_t;
- 
- // Estrutura para eventos de botão
- typedef struct {
-     uint32_t gpio;
-     uint32_t state;  // 1 = pressionado (FALL), 0 = liberado (RISE)
- } button_event_t;
- 
- QueueHandle_t xQueueADC;
- QueueHandle_t xQueueInput;  // Alterado para receber objetos do tipo button_event_t
- 
- // ---------------- Funções de Utilidade ---------------- //
- 
- // Processa o valor bruto do ADC, aplicando escala e zona morta.
- static int process_adc_value(uint16_t raw_adc) {
-     int centered = (int)raw_adc - ADC_CENTER;
-     float scale_factor = (float)JOYSTICK_MAX / (ADC_CENTER - 1);
-     int scaled = (int)(centered * scale_factor);
-     
-     if (scaled > -DEAD_ZONE && scaled < DEAD_ZONE) {
-         scaled = 0;
-     }
-     return scaled;
- }
- 
- // Calcula um checksum simples (XOR dos bytes)
- uint8_t calc_checksum(uint8_t *data, int len) {
-     uint8_t checksum = 0;
-     for (int i = 0; i < len; i++) {
-         checksum ^= data[i];
-     }
-     return checksum;
- }
- 
- // Monta e envia um pacote via UART conforme o protocolo definido.
- void send_packet_uart(uint8_t msg_type, uint8_t *payload, uint8_t payload_size) {
-     uint8_t packet[10];  // Ajuste se necessário
-     int idx = 0;
-     
-     packet[idx++] = PKT_HEADER;
-     packet[idx++] = msg_type;
-     packet[idx++] = payload_size;
-     
-     for (int i = 0; i < payload_size; i++) {
-         packet[idx++] = payload[i];
-     }
-     
-     uint8_t checksum = calc_checksum(&packet[1], 2 + payload_size);
-     packet[idx++] = checksum;
-     packet[idx++] = PKT_FOOTER;
-     
-     uart_write_blocking(UART_ID, packet, idx);
- }
- 
- // ---------------- Tasks de Aquisição ---------------- //
- 
- // Task para aquisição dos dados do eixo X.
- void x_task(void *p) {
-     adc_gpio_init(GPx);
-     uint16_t samples[AVG_SAMPLES] = {0};
-     int index = 0, count = 0, sum = 0;
-     
-     while (1) {
-         adc_select_input(0);  // Canal 0 para eixo X.
-         uint16_t raw = adc_read();
-         
-         if (count < AVG_SAMPLES) {
-             samples[index] = raw;
-             sum += raw;
-             count++;
-         } else {
-             sum -= samples[index];
-             samples[index] = raw;
-             sum += raw;
-         }
-         index = (index + 1) % AVG_SAMPLES;
-         int avg_raw = sum / count;
-         int scaled_val = process_adc_value(avg_raw);
-         
-         if (scaled_val != 0) {
-             adc_t data;
-             data.axis = 0;
-             data.val  = scaled_val;
-             xQueueSend(xQueueADC, &data, 0);
-         }
-         vTaskDelay(pdMS_TO_TICKS(10));
-     }
- }
- 
- // Task para aquisição dos dados do eixo Y.
- void y_task(void *p) {
-     adc_gpio_init(GPy);
-     uint16_t samples[AVG_SAMPLES] = {0};
-     int index = 0, count = 0, sum = 0;
-     
-     while (1) {
-         adc_select_input(1);  // Canal 1 para eixo Y.
-         uint16_t raw = adc_read();
-         
-         if (count < AVG_SAMPLES) {
-             samples[index] = raw;
-             sum += raw;
-             count++;
-         } else {
-             sum -= samples[index];
-             samples[index] = raw;
-             sum += raw;
-         }
-         index = (index + 1) % AVG_SAMPLES;
-         int avg_raw = sum / count;
-         int scaled_val = process_adc_value(avg_raw);
-         
-         if (scaled_val != 0) {
-             adc_t data;
-             data.axis = 1;
-             data.val  = scaled_val;
-             xQueueSend(xQueueADC, &data, 0);
-         }
-         vTaskDelay(pdMS_TO_TICKS(10));
-     }
- }
- 
- // Task para aquisição do potenciômetro (por exemplo, pedal ou volante).
- void pot_task(void *p) {
-     adc_gpio_init(WHEEL_PIN);
-     uint16_t samples[AVG_SAMPLES] = {0};
-     int index = 0, count = 0, sum = 0;
-     
-     while (1) {
-         adc_select_input(2);  // Canal 2 para o potenciômetro.
-         uint16_t raw = adc_read();
-         
-         if (count < AVG_SAMPLES) {
-             samples[index] = raw;
-             sum += raw;
-             count++;
-         } else {
-             sum -= samples[index];
-             samples[index] = raw;
-             sum += raw;
-         }
-         index = (index + 1) % AVG_SAMPLES;
-         int avg_raw = sum / count;
-         int scaled_val = process_adc_value(avg_raw);
-         
-         if (scaled_val != 0) {
-             adc_t data;
-             data.axis = 2;
-             data.val  = scaled_val;
-             xQueueSend(xQueueADC, &data, 0);
-         }
-         vTaskDelay(pdMS_TO_TICKS(10));
-     }
- }
- 
- // ---------------- Task de Comunicação UART ---------------- //
- 
- // A task envia dados analógicos e eventos de botão via UART.
- void uart_task(void *p) {
-     adc_t adc_data;
-     button_event_t btn_event;
-     
-     while (1) {
-         // Processa eventos de botão recebidos na fila.
-         while (xQueueReceive(xQueueInput, &btn_event, 0) == pdPASS) {
-             if (btn_event.gpio == START_BTN) {
-                 // Lógica de START.
-                 if (uxSemaphoreGetCount(xCommSemaphore) == 0) {
-                     xSemaphoreGive(xCommSemaphore);
-                     gpio_put(LED, 1);  // Acende o LED.
-                     printf("Comunicação iniciada via botão START!\n");
-                     // (Opcional) Enviar pacote especial de START.
-                 }
-             } else {
-                 uint8_t payload[BUTTON_PAYLOAD_SIZE];
-                 payload[0] = (uint8_t)btn_event.gpio;  // ID do botão.
-                 payload[1] = (uint8_t)btn_event.state; // Estado (1 ou 0).
-                 send_packet_uart(MSG_BUTTON, payload, BUTTON_PAYLOAD_SIZE);
-             }
-         }
-         
-         // Processa dados analógicos se a comunicação tiver sido iniciada.
-         if (uxSemaphoreGetCount(xCommSemaphore) > 0) {
-             while (xQueueReceive(xQueueADC, &adc_data, 0) == pdPASS) {
-                 uint8_t payload[ANALOG_PAYLOAD_SIZE];
-                 payload[0] = (uint8_t)adc_data.axis;
-                 int16_t movement = (int16_t)adc_data.val;
-                 payload[1] = (uint8_t)((movement >> 8) & 0xFF);  // MSB.
-                 payload[2] = (uint8_t)(movement & 0xFF);         // LSB.
-                 send_packet_uart(MSG_ANALOG, payload, ANALOG_PAYLOAD_SIZE);
-             }
-         }
-         vTaskDelay(pdMS_TO_TICKS(10));
-     }
- }
- 
- // ---------------- Callback para Botões ---------------- //
- 
- // A função de callback é chamada em interrupção quando ocorre uma mudança no botão.
- // Ela determina o estado com base nos eventos (FALL para pressionado, RISE para liberado)
- // e envia um objeto button_event_t para a fila.
- void btn_callback(uint gpio, uint32_t events) {
-     button_event_t btn_evt;
-     btn_evt.gpio = gpio;
-     
-     // Se o evento tiver a flag FALL, o botão foi pressionado; se tiver RISE, foi liberado.
-     if (events & GPIO_IRQ_EDGE_FALL) {
-         btn_evt.state = 1;  // Pressionado.
-     } else if (events & GPIO_IRQ_EDGE_RISE) {
-         btn_evt.state = 0;  // Liberado.
-     } else {
-         // Caso não seja reconhecido, ignore.
-         return;
-     }
-     xQueueSendFromISR(xQueueInput, &btn_evt, 0);
- }
- 
- // ---------------- Configurações de Hardware ---------------- //
- 
- void setup_uart() {
-     uart_init(UART_ID, BAUD_RATE);
-     gpio_set_function(UART_TX, GPIO_FUNC_UART);
-     gpio_set_function(UART_RX, GPIO_FUNC_UART);
- }
- 
- // ---------------- Função Principal ---------------- //
- 
- int main() {
-     stdio_init_all();
-     setup_uart();
-     adc_init();
-     
-     // Configuração do LED
-     gpio_init(LED);
-     gpio_set_dir(LED, GPIO_OUT);
-     gpio_put(LED, 0);
-     
-     // Configuração dos botões com pull-up
-     gpio_init(START_BTN);
-     gpio_set_dir(START_BTN, GPIO_IN);
-     gpio_pull_up(START_BTN);
-     
-     gpio_init(CLUTCH_BTN);
-     gpio_set_dir(CLUTCH_BTN, GPIO_IN);
-     gpio_pull_up(CLUTCH_BTN);
-     
-     gpio_init(UPSHIFT_BTN);
-     gpio_set_dir(UPSHIFT_BTN, GPIO_IN);
-     gpio_pull_up(UPSHIFT_BTN);
-     
-     gpio_init(DOWNSHIFT_BTN);
-     gpio_set_dir(DOWNSHIFT_BTN, GPIO_IN);
-     gpio_pull_up(DOWNSHIFT_BTN);
-     
-     gpio_init(BREAK_BTN);
-     gpio_set_dir(BREAK_BTN, GPIO_IN);
-     gpio_pull_up(BREAK_BTN);
-     
-     gpio_init(ACCELERATE_BTN);
-     gpio_set_dir(ACCELERATE_BTN, GPIO_IN);
-     gpio_pull_up(ACCELERATE_BTN);
-     
-     // Configura interrupção para o botão START com ambas as bordas e uma callback.
-     gpio_set_irq_enabled_with_callback(START_BTN, GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE, true, btn_callback);
-     // Habilita interrupção para os demais botões (usando a mesma callback)
-     gpio_set_irq_enabled(CLUTCH_BTN, GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE, true);
-     gpio_set_irq_enabled(UPSHIFT_BTN, GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE, true);
-     gpio_set_irq_enabled(DOWNSHIFT_BTN, GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE, true);
-     gpio_set_irq_enabled(BREAK_BTN, GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE, true);
-     gpio_set_irq_enabled(ACCELERATE_BTN, GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE, true);
-     
-     // Cria as filas
-     xQueueADC   = xQueueCreate(10, sizeof(adc_t));
-     xQueueInput = xQueueCreate(10, sizeof(button_event_t));
-     
-     // Cria o semáforo que sinaliza o início da comunicação (inicialmente vazio)
-     xCommSemaphore = xSemaphoreCreateBinary();
-     
-     // Criação das tasks
-     xTaskCreate(x_task,    "X_Axis",        256, NULL, 1, NULL);
-     xTaskCreate(y_task,    "Y_Axis",        256, NULL, 1, NULL);
-     xTaskCreate(pot_task,  "Potentiometer", 256, NULL, 1, NULL);
-     xTaskCreate(uart_task, "UART_Task",     256, NULL, 1, NULL);
-     
-     vTaskStartScheduler();
-     
-     while (true) { }
- }
- 
+#include "pico/stdlib.h"
+#include "hardware/gpio.h"
+#include "hardware/adc.h"
+#include "hardware/uart.h"
+#include "hardware/i2c.h"
+
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+
+#include "hc06.h"
+#include "mpu6050.h"
+#include "Fusion.h"
+
+// ---------------- Constantes e Definições ---------------- //
+#define AVG_SAMPLES        10
+#define ADC_MAX            4095
+#define ADC_CENTER         2048
+#define JOYSTICK_MAX       255
+#define DEAD_ZONE          30
+#define SAMPLE_PERIOD      (0.01f)   // 10 ms
+
+// Pinos de hardware
+const int BUZZER_PIN       = 14;
+const int LED              = 15;
+const int START_BTN        = 16;
+const int CLUTCH_BTN       = 17;
+const int UPSHIFT_BTN      = 18;
+const int DOWNSHIFT_BTN    = 19;
+const int BREAK_BTN        = 20;
+const int ACCELERATE_BTN   = 21;
+const int WHEEL_PIN        = 28;
+const int GPy              = 27;
+const int GPx              = 26;
+
+// I2C para MPU6050
+#define MPU_ADDRESS     0x68
+#define I2C_SDA_GPIO    12
+#define I2C_SCL_GPIO    13
+#define MPU_CLICK_BTN   100   // Valor virtual para identificar o botão de click do MPU
+
+// UART "fila USB"
+#define UART_ID            uart0
+#define UART_TX_PIN        0
+#define UART_RX_PIN        1
+#define BAUD_RATE          115200
+
+// UART Bluetooth HC-06
+#define BT_UART_ID         uart1
+#define BT_TX_PIN          5   // ajuste conforme wiring
+#define BT_RX_PIN          4   // ajuste conforme wiring
+#define HC06_ENABLE_PIN    6   // pino para AT-Mode do HC-06
+#define HC06_BAUD_RATE     9600
+
+// Protocolo
+#define PKT_HEADER         0xAA
+#define PKT_FOOTER         0xFF
+#define MSG_ANALOG         0x01
+#define MSG_BUTTON         0x02
+
+#define ANALOG_PAYLOAD_SIZE   3
+#define BUTTON_PAYLOAD_SIZE   2
+
+// ---------------- Variáveis Globais ---------------- //
+SemaphoreHandle_t xCommSemaphore;
+SemaphoreHandle_t xAccelerateSemaphore;
+QueueHandle_t xQueueADC;
+QueueHandle_t xQueueInput;
+
+typedef struct {
+    int axis;
+    int val;
+} adc_t;
+
+typedef struct {
+    uint32_t gpio;
+    uint32_t state;
+} button_event_t;
+
+// ---------------- Funções de Utilidade ---------------- //
+static int process_adc_value(uint16_t raw_adc) {
+    int centered = (int)raw_adc - ADC_CENTER;
+    float scale = (float)JOYSTICK_MAX / (ADC_CENTER - 1);
+    int scaled = (int)(centered * scale);
+    if (scaled > -DEAD_ZONE && scaled < DEAD_ZONE) scaled = 0;
+    return scaled;
+}
+
+uint8_t calc_checksum(uint8_t *data, int len) {
+    uint8_t cs = 0;
+    for (int i = 0; i < len; i++) cs ^= data[i];
+    return cs;
+}
+
+void send_packet_uart(uint8_t msg_type, uint8_t *payload, uint8_t payload_size) {
+    uint8_t packet[10];
+    int idx = 0;
+    packet[idx++] = PKT_HEADER;
+    packet[idx++] = msg_type;
+    packet[idx++] = payload_size;
+    for (int i = 0; i < payload_size; i++) packet[idx++] = payload[i];
+    packet[idx++] = calc_checksum(&packet[1], 2 + payload_size);
+    packet[idx++] = PKT_FOOTER;
+
+    // envia pela USB
+    //uart_write_blocking(UART_ID, packet, idx);
+    // envia pelo Bluetooth
+    uart_write_blocking(BT_UART_ID, packet, idx);
+}
+
+// ---------------- Funções do MPU6050 ---------------- //
+static void mpu6050_reset() {
+    uint8_t buf[] = {0x6B, 0x00};  // PWR_MGMT_1 = 0
+    i2c_write_blocking(i2c_default, MPU_ADDRESS, buf, 2, false);
+}
+
+static void mpu6050_read_raw(int16_t accel[3], int16_t gyro[3], int16_t *temp) {
+    uint8_t buffer[6];
+    uint8_t reg;
+
+    // Leitura acelerômetro
+    reg = 0x3B;
+    i2c_write_blocking(i2c_default, MPU_ADDRESS, &reg, 1, true);
+    i2c_read_blocking(i2c_default, MPU_ADDRESS, buffer, 6, false);
+    for (int i = 0; i < 3; i++) {
+        accel[i] = (buffer[2*i] << 8) | buffer[2*i+1];
+    }
+
+    // Leitura giroscópio
+    reg = 0x43;
+    i2c_write_blocking(i2c_default, MPU_ADDRESS, &reg, 1, true);
+    i2c_read_blocking(i2c_default, MPU_ADDRESS, buffer, 6, false);
+    for (int i = 0; i < 3; i++) {
+        gyro[i] = (buffer[2*i] << 8) | buffer[2*i+1];
+    }
+
+    // Leitura temperatura
+    reg = 0x41;
+    i2c_write_blocking(i2c_default, MPU_ADDRESS, &reg, 1, true);
+    i2c_read_blocking(i2c_default, MPU_ADDRESS, buffer, 2, false);
+    *temp = (buffer[0] << 8) | buffer[1];
+}
+
+// ---------------- Tasks de Aquisição ---------------- //
+void x_task(void *p) {
+    adc_gpio_init(GPx);
+    uint16_t samples[AVG_SAMPLES] = {0};
+    int idx = 0, count = 0, sum = 0;
+    while (1) {
+        adc_select_input(0);
+        uint16_t raw = adc_read();
+        if (count < AVG_SAMPLES) { samples[idx] = raw; sum += raw; count++; }
+        else { sum -= samples[idx]; samples[idx] = raw; sum += raw; }
+        idx = (idx + 1) % AVG_SAMPLES;
+        int scaled = process_adc_value(sum / count);
+        if (scaled) {
+            adc_t d = { .axis = 0, .val = scaled };
+            xQueueSend(xQueueADC, &d, 0);
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+void y_task(void *p) {
+    adc_gpio_init(GPy);
+    uint16_t samples[AVG_SAMPLES] = {0};
+    int idx = 0, count = 0, sum = 0;
+    while (1) {
+        adc_select_input(1);
+        uint16_t raw = adc_read();
+        if (count < AVG_SAMPLES) { samples[idx] = raw; sum += raw; count++; }
+        else { sum -= samples[idx]; samples[idx] = raw; sum += raw; }
+        idx = (idx + 1) % AVG_SAMPLES;
+        int scaled = process_adc_value(sum / count);
+        if (scaled) {
+            adc_t d = { .axis = 1, .val = scaled };
+            xQueueSend(xQueueADC, &d, 0);
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+void pot_task(void *p) {
+    adc_gpio_init(WHEEL_PIN);
+    uint16_t samples[AVG_SAMPLES] = {0};
+    int idx = 0, count = 0, sum = 0;
+    while (1) {
+        adc_select_input(2);
+        uint16_t raw = adc_read();
+        if (count < AVG_SAMPLES) { samples[idx] = raw; sum += raw; count++; }
+        else { sum -= samples[idx]; samples[idx] = raw; sum += raw; }
+        idx = (idx + 1) % AVG_SAMPLES;
+        int scaled = process_adc_value(sum / count);
+        if (scaled) {
+            adc_t d = { .axis = 2, .val = scaled };
+            xQueueSend(xQueueADC, &d, 0);
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+// ---------------- Task do MPU6050 ---------------- //
+void mpu6050_task(void *p) {
+    // Inicializa e configura o MPU6050
+    int16_t rawAccel[3], rawGyro[3], rawTemp;
+    
+    // Variáveis para detecção de click
+    uint8_t lastClickState = 0;
+    button_event_t btn_evt;
+
+    while (1) {
+        mpu6050_read_raw(rawAccel, rawGyro, &rawTemp);
+
+        FusionVector accelerometer = {
+            .axis.x = rawAccel[0] / 16384.0f,
+            .axis.y = rawAccel[1] / 16384.0f,
+            .axis.z = rawAccel[2] / 16384.0f,
+        };
+
+        // Determina se houve um click com base na aceleração em Z
+        uint8_t clickState = (accelerometer.axis.z > 0.5f) ? 1 : 0;
+        
+        // Se houve mudança no estado do click, envia para a fila de botões
+        if (clickState != lastClickState) {
+            btn_evt.gpio = MPU_CLICK_BTN;  // Identificador virtual para o botão de click do MPU
+            btn_evt.state = clickState;
+            xQueueSend(xQueueInput, &btn_evt, 0);
+            lastClickState = clickState;
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(10));  // 10 ms
+    }
+}
+
+// ---------------- Configuração UART e HC-06 ---------------- //
+void setup_uart() {
+//    // 1) USB
+//    uart_init(UART_ID, BAUD_RATE);
+//    gpio_set_function(UART_TX_PIN, GPIO_FUNC_UART);
+//    gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
+
+   // 2) Bluetooth HC-06: UART1
+   uart_init(BT_UART_ID, HC06_BAUD_RATE);
+   gpio_set_function(BT_RX_PIN, GPIO_FUNC_UART);
+   gpio_set_function(BT_TX_PIN, GPIO_FUNC_UART);
+}
+
+// ---------------- Task de Comunicação UART ---------------- //
+void uart_task(void *p) {
+    adc_t adc_data;
+    button_event_t btn;
+
+    hc06_init("Volante BT", "1234");
+
+    sleep_ms(100);
+    //printf("Sistema iniciado e pronto\n");
+    while (1) {
+        while (xQueueReceive(xQueueInput, &btn, 0) == pdPASS) {
+            if (btn.gpio == START_BTN && uxSemaphoreGetCount(xCommSemaphore) == 0) {
+                xSemaphoreGive(xCommSemaphore);
+                gpio_put(LED, 1);
+                //printf("Comunicação iniciada via START!\n");
+            }
+            if (btn.gpio == ACCELERATE_BTN) {
+                if (btn.state && uxSemaphoreGetCount(xAccelerateSemaphore) == 0)
+                    xSemaphoreGive(xAccelerateSemaphore);
+                else if (!btn.state && uxSemaphoreGetCount(xAccelerateSemaphore) > 0)
+                    xSemaphoreTake(xAccelerateSemaphore, 0);
+            }
+            uint8_t payload[BUTTON_PAYLOAD_SIZE] = { (uint8_t)btn.gpio, (uint8_t)btn.state };
+            send_packet_uart(MSG_BUTTON, payload, BUTTON_PAYLOAD_SIZE);
+        }
+        
+        // Se a comunicação estiver habilitada
+        if (uxSemaphoreGetCount(xCommSemaphore) > 0) {
+            // Processa dados do ADC
+            while (xQueueReceive(xQueueADC, &adc_data, 0) == pdPASS) {
+                uint8_t payload[ANALOG_PAYLOAD_SIZE] = {
+                    (uint8_t)adc_data.axis,
+                    (uint8_t)((adc_data.val >> 8) & 0xFF),
+                    (uint8_t)(adc_data.val & 0xFF)
+                };
+                send_packet_uart(MSG_ANALOG, payload, ANALOG_PAYLOAD_SIZE);
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+// ---------------- Task do Buzzer ---------------- //
+void buzzer_task(void *p) {
+    const uint32_t half_period = 1000000 / (2 * 440);
+    while (1) {
+        if (uxSemaphoreGetCount(xAccelerateSemaphore) > 0) {
+            gpio_put(BUZZER_PIN, 1);
+            sleep_us(half_period);
+            gpio_put(BUZZER_PIN, 0);
+            sleep_us(half_period);
+        } else {
+            gpio_put(BUZZER_PIN, 0);
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+}
+
+// ---------------- Callback dos Botões ---------------- //
+void btn_callback(uint gpio, uint32_t events) {
+    button_event_t evt = { .gpio = gpio };
+    if (events & GPIO_IRQ_EDGE_FALL) evt.state = 1;
+    else if (events & GPIO_IRQ_EDGE_RISE) evt.state = 0;
+    else return;
+    xQueueSendFromISR(xQueueInput, &evt, 0);
+}
+
+// ---------------- Função Principal ---------------- //
+int main() {
+    stdio_init_all();
+
+    // Configura UARTs e HC-06
+    setup_uart();
+
+    // Inicializa I2C para o MPU6050
+    i2c_init(i2c_default, 400 * 1000);
+    gpio_set_function(I2C_SDA_GPIO, GPIO_FUNC_I2C);
+    gpio_set_function(I2C_SCL_GPIO, GPIO_FUNC_I2C);
+    gpio_pull_up(I2C_SDA_GPIO);
+    gpio_pull_up(I2C_SCL_GPIO);
+    
+    // Reset do sensor MPU6050
+    mpu6050_reset();
+
+    // ADC
+    adc_init();
+
+    // LED
+    gpio_init(LED);
+    gpio_set_dir(LED, GPIO_OUT);
+    gpio_put(LED, 0);
+
+    // Botões
+    int btns[] = {START_BTN, CLUTCH_BTN, UPSHIFT_BTN, DOWNSHIFT_BTN, BREAK_BTN, ACCELERATE_BTN};
+    for (int i = 0; i < 6; i++) {
+        gpio_init(btns[i]);
+        gpio_set_dir(btns[i], GPIO_IN);
+        gpio_pull_up(btns[i]);
+    }
+    gpio_set_irq_enabled_with_callback(START_BTN, GPIO_IRQ_EDGE_FALL|GPIO_IRQ_EDGE_RISE, true, btn_callback);
+    for (int i = 1; i < 6; i++) {
+        gpio_set_irq_enabled(btns[i], GPIO_IRQ_EDGE_FALL|GPIO_IRQ_EDGE_RISE, true);
+    }
+
+    // Buzzer
+    gpio_init(BUZZER_PIN);
+    gpio_set_dir(BUZZER_PIN, GPIO_OUT);
+    gpio_put(BUZZER_PIN, 0);
+
+    // Filas e semáforos
+    xQueueADC            = xQueueCreate(10, sizeof(adc_t));
+    xQueueInput          = xQueueCreate(10, sizeof(button_event_t));
+    xCommSemaphore       = xSemaphoreCreateBinary();
+    xAccelerateSemaphore = xSemaphoreCreateBinary();
+
+    // Criação das tasks
+    xTaskCreate(x_task,        "X_Axis",        256, NULL, 1, NULL);
+    xTaskCreate(y_task,        "Y_Axis",        256, NULL, 1, NULL);
+    xTaskCreate(pot_task,      "Potentiometer", 256, NULL, 1, NULL);
+    xTaskCreate(mpu6050_task,  "MPU6050",       512, NULL, 1, NULL);  // Task para MPU6050
+    xTaskCreate(uart_task,     "UART_Task",     512, NULL, 1, NULL);
+    xTaskCreate(buzzer_task,   "Buzzer_Task",   256, NULL, 1, NULL);
+
+    // Inicia scheduler
+    vTaskStartScheduler();
+
+    while (1) {}
+    return 0;
+}

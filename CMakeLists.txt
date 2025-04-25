@@ -7,6 +7,7 @@ endif()
 set(sdkVersion 2.1.0)
 set(toolchainVersion 13_3_Rel1)
 set(picotoolVersion 2.1.0)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(picoVscode ${USERHOME}/.pico-sdk/cmake/pico-vscode.cmake)
 if (EXISTS ${picoVscode})
     include(${picoVscode})
@@ -27,6 +28,7 @@ pico_sdk_init()
 
 # rest of your project
 
+add_subdirectory(Fusion)
 add_subdirectory(freertos)
 add_subdirectory(main)
 
