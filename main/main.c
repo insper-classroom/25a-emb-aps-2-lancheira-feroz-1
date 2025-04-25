@@ -91,13 +91,13 @@ static int process_adc_value(uint16_t raw_adc) {
     return scaled;
 }
 
-uint8_t calc_checksum(uint8_t *data, int len) {
+uint8_t calc_checksum(const uint8_t *data, int len) {
     uint8_t cs = 0;
     for (int i = 0; i < len; i++) cs ^= data[i];
     return cs;
 }
 
-void send_packet_uart(uint8_t msg_type, uint8_t *payload, uint8_t payload_size) {
+void send_packet_uart(uint8_t msg_type, const uint8_t *payload, uint8_t payload_size) {
     uint8_t packet[10];
     int idx = 0;
     packet[idx++] = PKT_HEADER;
@@ -257,7 +257,7 @@ void uart_task(void *p) {
 
     hc06_init("Volante BT", "1234");
 
-    sleep_ms(100);
+    //sleep_ms(100);
     //printf("Sistema iniciado e pronto\n");
     while (1) {
         while (xQueueReceive(xQueueInput, &btn, 0) == pdPASS) {
@@ -298,9 +298,9 @@ void buzzer_task(void *p) {
     while (1) {
         if (uxSemaphoreGetCount(xAccelerateSemaphore) > 0) {
             gpio_put(BUZZER_PIN, 1);
-            sleep_us(half_period);
+            vTaskDelay(pdMS_TO_TICKS(half_period / 1000));
             gpio_put(BUZZER_PIN, 0);
-            sleep_us(half_period);
+            vTaskDelay(pdMS_TO_TICKS(half_period / 1000));
         } else {
             gpio_put(BUZZER_PIN, 0);
             vTaskDelay(pdMS_TO_TICKS(10));
