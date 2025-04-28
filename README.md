@@ -49,7 +49,7 @@ Novidades desta versão:
 ---
 
 ## Diagrama de Blocos do Firmware
-![Proposta](diagrama-white.png)
+![Proposta](diagrama.png)
 
 ---
 
@@ -67,6 +67,6 @@ Novidades desta versão:
 ## Imagens do Volante
 
 ### Proposta Atualizada  
-![Proposta](esboco.jpg)
+![Proposta](copada-diagrama.jpeg)
 
 *A alavanca física do freio de mão foi adicionada ao lado direito; LED e buzzer mantêm posição original.*
