@@ -1,88 +1,72 @@
 # Controle Customizado para Need for Speed
 
-## Jogo
-**Need for Speed** – Série de jogos de corrida onde o jogador participa de disputas em alta velocidade, utilizando carros customizados em diferentes pistas (urbanas ou circuitos fechados).
+## Jogo  
+**Need for Speed** – série de jogos de corrida em que o jogador compete em alta velocidade com carros customizados em pistas urbanas ou circuitos fechados.
 
 ---
 
-## Ideia do Controle
-Este projeto consiste em um **volante personalizado** para uso em *Need for Speed*, porém **sem pedais analógicos**. Em vez disso, **aceleração** e **freio** serão acionados por **botões digitais**. Haverá:
-- **1 eixo analógico** (potenciômetro) para o ângulo de direção do volante.
-- **1 joystick analógico** para movimentação no menu do jogo.
-- **5 entradas digitais** (GPIO) para as principais funções de corrida (acelerar, frear, trocar marcha para cima/baixo, nitro).
+## Ideia do Controle  
+Um **volante personalizado** sem pedais analógicos.  
+A aceleração, o freio normal **e o freio de mão** são botões digitais.  
+Novidades desta versão:
 
-Além disso, teremos **feedback** por meio de um **LED indicador** e um **buzzer** para alertas ou efeitos sonoros simples.
+- **IMU (MPU-6050)** detecta “tap” / inclinação brusca no eixo Z e envia **ENTER** (confirmar no menu).  
+- Botão **Freio de Mão** dedicado (`BREAK_BTN`).  
 
 ---
 
 ## Entradas (Inputs)
 
-1. **Volante (Eixo Analógico)**  
-   - **Potenciômetro** acoplado ao eixo do volante para detectar o ângulo de rotação.  
-   - Valores podem variar de 0 a 1023 (caso de ADC de 10 bits), mapeados para esquerda (0) até direita (máximo).
-  
-2. **Joystick Analógico (Para Menu)**
-   - Um pequeno joystick com ao menos **2 eixos analógicos** (eixo X e eixo Y).  
-   - Serve para navegar pelos menus do jogo (selecionar opções, voltar, trocar configurações, etc.).  
-   - Cada eixo envia valores de 0 a 1023 (ADC de 10 bits), podendo ser mapeados para cima/baixo/esquerda/direita dentro do menu.
+| Tipo | Qtde | Descrição | Mapeamento no Firmware |
+|------|------|-----------|------------------------|
+| **Eixo analógico – Potenciômetro** | 1 | Ângulo do volante | `WHEEL_PIN` (ADC 2) |
+| **Joystick analógico** | 2 eixos | Navegação no menu (X/Y) | `GPx` (ADC 0) / `GPy` (ADC 1) |
+| **Botões digitais (GPIO)** | 6 | Acelerar, Frear, **Freio de Mão**, Shift Up, Shift Down, Start | `ACCELERATE_BTN`, `BREAK_BTN`, … |
+| **IMU → “Click” virtual** | 1 | Detecção de batida/impulso no eixo Z gera ENTER | `MPU_CLICK_BTN` |
 
-3. **5 Entradas Digitais (Botões/GPIO):**  
-   1. **Acelerar (Botão)** – em vez de pedal analógico.  
-   2. **Frear (Botão)** – em vez de pedal analógico.  
-   3. **Shift Up** (troca de marcha para cima).  
-   4. **Shift Down** (troca de marcha para baixo).  
-   5. **Nitro** (impulso extra de velocidade).
+> Valores entre ±30 (const `DEAD_ZONE`) nos eixos analógicos são zerados para evitar ruído (debounce).
 
 ---
 
 ## Saídas (Outputs)
 
-1. **LED Indicador**  
-   - Sinalizar status de conexão com o PC.
-
-2. **Buzzer** (opcional)  
-   - Para alertas sonoros (ex.: ativar nitro) ou confirmação de troca de marcha.  
-
----
-
-## Protocolo Utilizado
-
-- **UART (Universal Asynchronous Receiver-Transmitter)** para comunicação entre o volante e o computador.
-- **GPIO Interrupts** para os botões e entradas digitais.
+| Dispositivo | Função |
+|-------------|--------|
+| **LED** | Indica status de conexão (acende após handshake) |
+| **Buzzer** | Feedback sonoro (pulsos ao acelerar, confirmações de comando) |
 
 ---
 
-## Diagrama de Blocos Explicativo do Firmware
-### Estrutura Geral
+## Protocolo de Comunicação
+
+- **UART-Bluetooth (HC-06)** a `9600 baud`  
+  - **Header** `0xAA`, **Footer** `0xFF`  
+  - Mensagens: `0x01` (analógico – 3 bytes) / `0x02` (botão – 2 bytes)  
+  - **Checksum XOR** do payload para integridade  
+- UART-USB opcional (comentada) para debug/fallback  
+- **GPIO Interrupts** para todos os botões físicos
+
 ---
 
-![Estrutura](diagrama-white.png)
+## Diagrama de Blocos do Firmware
+![Proposta](diagrama-white.png)
 
 ---
 
-#### **Principais Componentes do RTOS**
+## Componentes FreeRTOS
 
-- **Tasks:**
-  - Task de leitura de entradas (botões e potenciômetro)
-  - Task de envio de comandos via UART
-  - Task de controle do buzzer para feedback sonoro
-  - Task de atualização do LED indicador
+| Categoria | Elementos |
+|-----------|-----------|
+| **Tasks** | `x_task`, `y_task`, `pot_task` (ADC) • `mpu6050_task` (IMU) • `uart_task` (comunicação) • `buzzer_task` (feedback) |
+| **Filas** | `xQueueADC` (ADC → protocolo) • `xQueueInput` (botões / IMU) |
+| **Semáforos** | `xCommSemaphore` (conexão ativa) • `xAccelerateSemaphore` (acelerador pressionado) |
+| **Interrupts** | `btn_callback` único para todos os GPIOs |
 
-- **Filas:**
-  - Fila de eventos de entrada
-  - Fila de comandos para o jogo
-  - Fila de feedback sonoro para o buzzer
-
-- **Semáforos:**
-  - Verificação do estado de conexão
-
-- **Interrupts:**
-  - Callbacks para os botões e potenciômetro
+---
 
 ## Imagens do Volante
-### Proposta Inicial
----
 
+### Proposta Atualizada  
 ![Proposta](esboco.jpg)
 
----
+*A alavanca física do freio de mão foi adicionada ao lado direito; LED e buzzer mantêm posição original.*
